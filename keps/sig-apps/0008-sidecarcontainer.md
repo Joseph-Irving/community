@@ -35,11 +35,16 @@ status: provisional
 
 ## Summary
 
-To solve the issue of sidecars not being well supported we can create a new type of container called a sidecar which are handled like normal containers but with the caveat that running sidecar containers will always be terminated when all non-sidecar containers have terminated. This will solve the problem of Jobs not completing/failing when a sidecar container never exits due to it having no awareness of the 'primary' container.
+To solve the problem of container lifecycle dependency we can create a new class of container: a "sidecar container" that behaves primarily like a normal container but is handled differently during termination and startup.
 
 ## Motivation
 
-SideCar containers have always been used in some ways but just not formally identified as such, with the introduction of Jobs and Cronjobs it became clear that they're not handled very well. If you have a Job with two containers one of which is actually doing the main processing of the job and the other is just facilitating it, you encounter a problem when the main process finishes; your sidecar container will carry on running so the job will never finish.
+SideCar containers have always been used in some ways but just not formally identified as such, they are becoming more common in a lot of applications and as more people have used them, more issues have cropped up.
+
+Here are some examples of the main problems:
+
+### Jobs
+ If you have a Job with two containers one of which is actually doing the main processing of the job and the other is just facilitating it, you encounter a problem when the main process finishes; your sidecar container will carry on running so the job will never finish.
 
 The only way around this problem is to manage the sidecar container's lifecycle manually and arrange for it to exit when the main container exits. This is typically achieved by building an ad-hoc signalling mechanism to communicate completion status between containers. Common implementations use a shared scratch volume mounted into all pods, where lifecycle status can be communicated by creating and watching for the presence of files. This pattern has several disadvantages:
 
@@ -47,13 +52,22 @@ The only way around this problem is to manage the sidecar container's lifecycle 
 * Third-party containers typically require a wrapper to add this behaviour, normally provided via an entrypoint wrapper script implemented in the k8s container spec. This adds undesirable overhead and introduces repetition between the k8s and upstream container image specs.
 * The wrapping typically requires the presence of a shell in the container image, so this pattern does not work for minimal containers which ship without a toolchain.
 
-### Goals
+### Startup
+An application that has a proxy container acting as a sidecar may fail when it starts up as it's unable to communicate until its proxy has started up successfully. Readiness probes don't help if the application is trying to talk outbound.
 
-Solve issue [25908](https://github.com/kubernetes/kubernetes/issues/25908) so that sidecars can be easily handled without needing modifications to the container itself
+### Shutdown
+Applications that rely on sidecars may experience a high amount of errors when shutting down as the sidecar may terminate before the application has finished what it's doing.
 
-### Non-Goals
 
-Changing the way jobs are handled
+## Goals
+
+Solve issues so that they don't require application modification:
+[25908](https://github.com/kubernetes/kubernetes/issues/25908) - Job completion
+[65502](https://github.com/kubernetes/kubernetes/issues/65502) - Container startup dependencies
+
+## Non-Goals
+
+Allowing multiple containers to run at once during the init phase.
 
 ## Proposal
 
@@ -77,14 +91,34 @@ spec:
     command: ["do something to help my app"]
 
 ```
-These sidecar containers will be handled the same way as a non-sidecar container in almost all respects apart from the fact that when all non-sidecar containers have permanently terminated all running sidecar containers will also be terminated with a reason of `Completed`. The sidecars will be terminated by receiving a SIGTERM and will obey the `terminationGracePeriodSeconds` defined on the pod before being sent a SIGKILL. Sidecar containers will be terminated in the same way as non-sidecars when a pod is deleted.
+Sidecars will be started before normal containers but after init, so that they are ready before your main processes start.
 
-For example, in a job you can have as many sidecars as you like and all the running sidecars will be terminated when all the non-sidecar containers have terminated, causing your job to finish.
-If all the non-sidecars `Completed` the pod status will be `Succeeded`, if any of the non-sidecars terminated with `Error` the pod status will be `Failed` and if any of the sidecars terminated with `Error` before the non-sidecars terminated, the pod status will be `Failed`.
+This will change the Pod startup to look like this:
+* Init containers start
+* Init containers finish
+* Sidecars start
+* Containers start
 
-A possible extension would be to allow this to work with init containers, effectively having all init sidecars start at the beginning of the init phase and then being terminated when all non-sidecar init containers have completed.
+During pod termination sidecars will be terminated last:
+* Containers sent SIGTERM
+* Sidecars sent SIGTERM
+
+Both will still obey the grace period before being sent a SIGKILL
+
+PreStop Hooks will be sent to sidecars and containers at the same time.
+This will be useful in scenarios such as when your sidecar is a proxy so that it knows to no longer accept inbound requests but can continue to allow outbound ones until the the primary containers have shut down.
+
+To solve the problem of Jobs that don't complete: When RestartPolicy!=Always if all normal containers have reached a terminal state (Succeeded for restartPolicy=OnFailure, or Succeeded/Failed for restartPolicy=Never), then all sidecar containers will be sent a SIGTERM.
 
 ### Implementation Details/Notes/Constraints
+
+As this is a fairly large change I think it make sense to break this proposal down and phase in more functionality as we go, potential roadmap could look like:
+
+* Add sidecar field, use it for the shutdown triggering when RestartPolicy!=Always
+* Pre-stop hooks sent to sidecars before non sidecar containers
+* Sidecars are terminated after normal containers
+* Sidecars start before normal containers
+
 
 As this is a change to the Container spec we will be using feature gating, you will be required to explicitly enable this feature on the api server as recommended [here](https://github.com/kubernetes/community/blob/master/contributors/devel/api_changes.md#adding-unstable-features-to-stable-versions).
 
@@ -93,6 +127,8 @@ As this is a change to the Container spec we will be using feature gating, you w
 You could set all containers to be `sidecar: true`, this seems wrong, so maybe the api should do a validation check that at least one container is not a sidecar.
 
 Init containers would be able to have `sidecar: true` applied to them as it's an additional field to the container spec, this doesn't currently make sense as init containers are ran sequentially. We could get around this by having the api throw a validation error if you try to use this field on an init container or just ignore the field.
+
+Having it as a boolean could cause problems later down the line if more lifecycle related flags were added, perhaps it makes more sense to have something like `lifecycle: Sidecar` to make it more future proof.
 
 ## Graduation Criteria
 
@@ -105,5 +141,5 @@ Init containers would be able to have `sidecar: true` applied to them as it's an
 
 ## Alternatives
 
-One alternative would be to have a new field in the Pod Spec of `sidecarContainers:` where you could define a list of sidecar containers, however this would require a lot more work in terms of updating tooling to support this.
+One alternative would be to have a new field in the Pod Spec of `sidecarContainers:` where you could define a list of sidecar containers, however this would require more work in terms of updating tooling to support this.
 Another alternative would be to change the Job Spec to have a `primaryContainer` field to tell it which containers are important. However I feel this is perhaps too specific to job when this Sidecar concept could be useful in other scenarios.
